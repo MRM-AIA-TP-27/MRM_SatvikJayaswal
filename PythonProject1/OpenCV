@@ -1,0 +1,349 @@
+"""
+ArUco Marker Pose Estimation
+Detects 4x4, 5x5, and 6x6 ArUco markers and estimates their 3D pose in real-time
+Fixed for OpenCV 4.8+ compatibility
+"""
+
+import cv2
+import numpy as np
+import json
+import os
+
+# ===== IP WEBCAM CONFIGURATION =====
+# Set this to True if using IP Webcam on phone
+USE_IP_WEBCAM = True
+
+# Replace with YOUR phone's IP address from IP Webcam app and webapp
+IP_WEBCAM_URL = "http://10.120.158.248:8080/video"  #This is mine
+
+# ===================================
+
+class ArucoPoseEstimator:
+    def __init__(self, marker_size_mm=100, camera_source=None):
+        """
+        Initialize ArUco detector with support for multiple dictionaries.
+
+        Args:
+            marker_size_mm: Size of the ArUco marker in millimeters (measure the black square only)
+            camera_source: Camera index (0, 1, 2) or IP address for phone camera
+        """
+        self.marker_size = marker_size_mm / 1000.0  # Convert to meters
+        self.camera_source = camera_source
+
+        # Load camera calibration
+        self.camera_matrix, self.dist_coeffs = self.load_calibration()
+
+        # Initialize ArUco dictionaries (4x4, 5x5, 6x6)
+        self.aruco_dicts = {
+            '4x4_50': cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50),
+            '5x5_100': cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_100),
+            '6x6_250': cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
+        }
+
+        # ArUco detector parameters
+        self.parameters = cv2.aruco.DetectorParameters()
+
+        print("\n" + "="*60)
+        print("🎯 ARUCO POSE ESTIMATOR INITIALIZED")
+        print("="*60)
+        print(f"📏 Marker size: {marker_size_mm}mm")
+        print(f"📚 Supported dictionaries: {', '.join(self.aruco_dicts.keys())}")
+        print(f"📹 Camera source: {camera_source}")
+        print("="*60 + "\n")
+
+    def load_calibration(self):
+        """Load camera calibration from file or use default values."""
+        if os.path.exists('camera_calibration.json'):
+            with open('camera_calibration.json', 'r') as f:
+                data = json.load(f)
+                camera_matrix = np.array(data['camera_matrix'])
+                dist_coeffs = np.array(data['dist_coeffs'])
+                rms_error = data.get('rms_error', 'N/A')
+                img_count = data.get('image_count', 'N/A')
+
+                print("✅ Camera calibration loaded successfully!")
+                print(f"   - Calibration images: {img_count}")
+                print(f"   - RMS error: {rms_error}")
+                return camera_matrix, dist_coeffs
+        else:
+            print("\n" + "⚠"*30)
+            print("⚠  WARNING: No calibration file found!")
+            print("⚠"*30)
+            print("\n📝 Using default calibration values")
+            print("   Results will be LESS ACCURATE!\n")
+            print("✨ For better results:")
+            print("   1. Run: python calibrate_camera.py")
+            print("   2. Follow calibration instructions")
+            print("   3. Run this script again\n")
+
+            # Default calibration for typical webcam (approximate values)
+            camera_matrix = np.array([
+                [800, 0, 320],
+                [0, 800, 240],
+                [0, 0, 1]
+            ], dtype=float)
+            dist_coeffs = np.zeros((5, 1))
+            return camera_matrix, dist_coeffs
+
+    def detect_and_estimate_pose(self, frame):
+        """
+        Detect ArUco markers and estimate their pose.
+
+        Returns:
+            frame: Annotated frame with detected markers
+            markers: List of detected markers with pose information
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        all_markers = []
+
+        # Try detection with all dictionaries
+        for dict_name, aruco_dict in self.aruco_dicts.items():
+            detector = cv2.aruco.ArucoDetector(aruco_dict, self.parameters)
+            corners, ids, rejected = detector.detectMarkers(gray)
+
+            if ids is not None and len(ids) > 0:
+                # Draw detected markers (green outline)
+                cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+
+                # Estimate pose for each marker individually
+                for i in range(len(ids)):
+                    marker_id = ids[i][0]
+                    corner = corners[i]
+
+                    # Define 3D object points for the marker corners
+                    obj_points = np.array([
+                        [-self.marker_size/2, self.marker_size/2, 0],
+                        [self.marker_size/2, self.marker_size/2, 0],
+                        [self.marker_size/2, -self.marker_size/2, 0],
+                        [-self.marker_size/2, -self.marker_size/2, 0]
+                    ], dtype=np.float32)
+
+                    img_points = corner[0].astype(np.float32)
+
+                    # Estimate pose using solvePnP
+                    success, rvec, tvec = cv2.solvePnP(
+                        obj_points, img_points,
+                        self.camera_matrix, self.dist_coeffs,
+                        flags=cv2.SOLVEPNP_IPPE_SQUARE
+                    )
+
+                    if not success:
+                        continue
+
+                    # Draw 3D axes (X=Red, Y=Green, Z=Blue)
+                    axis_length = self.marker_size * 0.5
+                    cv2.drawFrameAxes(frame, self.camera_matrix, self.dist_coeffs,
+                                     rvec, tvec, axis_length)
+
+                    # Calculate distance (depth) from camera
+                    distance = np.linalg.norm(tvec)
+
+                    # Calculate rotation angles (Euler angles in degrees)
+                    rotation_matrix, _ = cv2.Rodrigues(rvec)
+                    angles = self.rotation_matrix_to_euler_angles(rotation_matrix)
+
+                    # Store marker information
+                    marker_info = {
+                        'id': marker_id,
+                        'dict': dict_name,
+                        'position': tvec,
+                        'distance': distance,
+                        'rotation': angles,
+                        'rvec': rvec,
+                        'tvec': tvec
+                    }
+                    all_markers.append(marker_info)
+
+                    # Display information on frame
+                    corner_point = corner[0][0]
+                    text_x = int(corner_point[0])
+                    text_y = int(corner_point[1]) - 15
+
+                    # Background for better readability
+                    overlay = frame.copy()
+                    cv2.rectangle(overlay, (text_x - 5, text_y - 75),
+                                (text_x + 280, text_y + 65), (0, 0, 0), -1)
+                    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+                    # Marker ID and dictionary type
+                    cv2.putText(frame, f"ID: {marker_id} [{dict_name}]",
+                               (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX,
+                               0.5, (0, 255, 255), 2)
+
+                    # Distance from camera
+                    cv2.putText(frame, f"Distance: {distance*100:.1f} cm",
+                               (text_x, text_y + 20), cv2.FONT_HERSHEY_SIMPLEX,
+                               0.45, (255, 255, 0), 1)
+
+                    # 3D Position (X, Y, Z)
+                    cv2.putText(frame, f"Pos: X:{tvec[0][0]*100:.1f} Y:{tvec[1][0]*100:.1f} Z:{tvec[2][0]*100:.1f} cm",
+                               (text_x, text_y + 38), cv2.FONT_HERSHEY_SIMPLEX,
+                               0.4, (255, 200, 100), 1)
+
+                    # Rotation angles (Roll, Pitch, Yaw)
+                    cv2.putText(frame, f"Rot: R:{angles[0]:.0f} P:{angles[1]:.0f} Y:{angles[2]:.0f} deg",
+                               (text_x, text_y + 55), cv2.FONT_HERSHEY_SIMPLEX,
+                               0.4, (150, 255, 150), 1)
+
+        return frame, all_markers
+
+    def rotation_matrix_to_euler_angles(self, R):
+        """
+        Convert rotation matrix to Euler angles (in degrees).
+        Returns [roll, pitch, yaw] in degrees.
+        """
+        sy = np.sqrt(R[0, 0] * R[0, 0] + R[1, 0] * R[1, 0])
+        singular = sy < 1e-6
+
+        if not singular:
+            x = np.arctan2(R[2, 1], R[2, 2])  # Roll
+            y = np.arctan2(-R[2, 0], sy)       # Pitch
+            z = np.arctan2(R[1, 0], R[0, 0])  # Yaw
+        else:
+            x = np.arctan2(-R[1, 2], R[1, 1])
+            y = np.arctan2(-R[2, 0], sy)
+            z = 0
+
+        return np.degrees([x, y, z])
+
+    def run(self):
+        """Run real-time ArUco detection and pose estimation."""
+        cap = cv2.VideoCapture(self.camera_source)
+
+        if not cap.isOpened():
+            print(f"\n❌ ERROR: Could not open camera with source: {self.camera_source}")
+            print("\n🔧 TROUBLESHOOTING:")
+            print("   - If using IP Webcam:")
+            print(f"     • Check if IP address is correct: {self.camera_source}")
+            print("     • Make sure 'Start Server' is pressed in IP Webcam app")
+            print("     • Verify both devices are on same WiFi")
+            print("     • Try opening URL in browser first")
+            print("   - If using built-in webcam: Try camera_source=0")
+            print("   - If using DroidCam: Try camera_source=1 or 2")
+            return
+
+        print("="*60)
+        print("🚀 ARUCO MARKER DETECTION STARTED")
+        print("="*60)
+        print("\n📋 CONTROLS:")
+        print("   'q' or ESC - Quit")
+        print("   's' - Save screenshot")
+        print("\n📌 INSTRUCTIONS:")
+        print("   1. Show ArUco markers (4x4, 5x5, or 6x6) to camera")
+        print("   2. Keep markers flat and well-lit")
+        print("   3. Entire marker must be visible in frame")
+        print("\n" + "="*60 + "\n")
+
+        frame_count = 0
+        screenshot_count = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("⚠ Warning: Could not read frame from camera")
+                break
+
+            # Detect markers and estimate pose
+            annotated_frame, markers = self.detect_and_estimate_pose(frame)
+
+            # Create info panel at top
+            panel_height = 80
+            panel = np.zeros((panel_height, annotated_frame.shape[1], 3), dtype=np.uint8)
+            panel[:] = (40, 40, 40)
+
+            # Display marker count
+            marker_text = f"Markers Detected: {len(markers)}"
+            cv2.putText(panel, marker_text, (10, 25),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            # Display controls
+            cv2.putText(panel, "Controls: 'Q'-Quit | 'S'-Screenshot", (10, 55),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+            # Display marker details
+            if markers:
+                details = f"IDs: {', '.join([str(m['id']) for m in markers])}"
+                cv2.putText(panel, details, (400, 25),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+            # Combine panel with frame
+            combined = np.vstack([panel, annotated_frame])
+
+            # Show frame
+            cv2.imshow('ArUco Pose Estimation', combined)
+
+            # Handle key presses
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord('q') or key == 27:  # 'q' or ESC
+                print("\n🛑 Stopping detection...")
+                break
+            elif key == ord('s'):
+                filename = f'aruco_screenshot_{screenshot_count:03d}.jpg'
+                cv2.imwrite(filename, combined)
+                print(f"📸 Screenshot saved: {filename}")
+                screenshot_count += 1
+
+            frame_count += 1
+
+        cap.release()
+        cv2.destroyAllWindows()
+
+        print("\n" + "="*60)
+        print(f"✅ Detection stopped")
+        print(f"📊 Total frames processed: {frame_count}")
+        print(f"📸 Screenshots saved: {screenshot_count}")
+        print("="*60 + "\n")
+
+def main():
+    print("\n" + "="*60)
+    print("   ARUCO MARKER POSE ESTIMATION SYSTEM")
+    print("="*60)
+
+    # Get marker size
+    print("\n📏 STEP 1: Marker Size")
+    print("Measure the BLACK SQUARE of your ArUco marker (not the white border)")
+    marker_size_input = input("Enter marker size in mm (press Enter for 100mm): ").strip()
+
+    if marker_size_input == "":
+        marker_size = 100
+    else:
+        try:
+            marker_size = float(marker_size_input)
+        except:
+            print("⚠ Invalid input, using 100mm")
+            marker_size = 100
+
+    # Determine camera source
+    if USE_IP_WEBCAM:
+        print("\n📹 STEP 2: Camera Source")
+        print(f"✅ Using IP Webcam: {IP_WEBCAM_URL}")
+        print("\n⚠️  Make sure:")
+        print("   1. IP Webcam app is running (Start Server pressed)")
+        print("   2. Both phone and laptop are on SAME WiFi")
+        print("   3. IP address in code matches your phone's IP")
+        camera_source = IP_WEBCAM_URL
+    else:
+        print("\n📹 STEP 2: Camera Source")
+        print("Options:")
+        print("  0 - Built-in webcam (default)")
+        print("  1 or 2 - DroidCam/External camera")
+
+        camera_input = input("\nEnter camera source (press Enter for 0): ").strip()
+
+        if camera_input == "":
+            camera_source = 0
+        else:
+            try:
+                camera_source = int(camera_input)
+            except:
+                print("⚠ Invalid input, using 0")
+                camera_source = 0
+
+    # Initialize and run
+    print("\n🔄 Initializing...")
+    estimator = ArucoPoseEstimator(marker_size_mm=marker_size, camera_source=camera_source)
+    estimator.run()
+
+if __name__ == "__main__":
+    main()
